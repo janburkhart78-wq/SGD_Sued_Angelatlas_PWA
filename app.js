@@ -3,6 +3,8 @@ const DATA = {
   stationierung: "data/geojson/rhein_stationierung_352_438.geojson",
   rheinkm: "data/geojson/rheinkilometer_352_439.geojson",
   buhnen: "data/geojson/buhnen_osm_352_438.geojson",
+  bootsslippen: "data/geojson/bootsslippen_osm_352_438.geojson",
+  parkplaetze: "data/geojson/parkplaetze_osm_352_438.geojson",
   sperrstrecken: "data/geojson/erlaubnis_sperrstrecken_2026.geojson",
   schutz: "data/geojson/schutzgebiete_korridor_352_438.geojson",
   militaer: "data/geojson/osm_militaer_korridor_352_438.geojson",
@@ -72,11 +74,15 @@ const styles = {
   sperrstrecken: { color: "#d62246", weight: 4, opacity: 0.9 },
   schutz: { color: "#338a4b", fillColor: "#55b96b", fillOpacity: 0.15, weight: 1 },
   militaer: { color: "#8e3a8b", fillColor: "#a85aa4", fillOpacity: 0.18, weight: 1 },
+  bootsslippen: { color: "#0f5e9c", fillColor: "#ffffff", fillOpacity: 1, weight: 2 },
+  parkplaetze: { color: "#0f5e9c", fillColor: "#ffffff", fillOpacity: 1, weight: 2 },
 };
 
 const layerLabels = {
   erlaubnis: "Erlaubnis",
   buhnen: "Buhnen",
+  bootsslippen: "Bootsslippen",
+  parkplaetze: "Parkplätze",
   sperrstrecken: "Sperrstrecken",
   schutz: "Schutzgebiete",
   militaer: "Militär/Warnkulisse",
@@ -108,12 +114,44 @@ async function loadText(path) {
 function makeLayer(key, geojson) {
   return L.geoJSON(geojson, {
     style: styles[key],
-    pointToLayer: (_feature, latlng) => L.circleMarker(latlng, styles[key]),
+    pointToLayer: (feature, latlng) => {
+      if (key === "bootsslippen") return L.marker(latlng, { icon: accessIcon("boat"), title: feature.properties?.name || "Bootsslip" });
+      if (key === "parkplaetze") return L.marker(latlng, { icon: accessIcon("parking"), title: feature.properties?.name || "Parkplatz" });
+      return L.circleMarker(latlng, styles[key]);
+    },
     onEachFeature: (feature, layer) => {
       const props = feature.properties || {};
       const title = props.bezeichnung || props.bereich || props.name || props.station_km || props.KM1 || key;
-      layer.bindPopup(`<strong>${title}</strong>`);
+      if (key === "bootsslippen" || key === "parkplaetze") {
+        const kind = key === "bootsslippen" ? "Bootsslip" : "Parkplatz";
+        const cost = props.kosten || "unbekannt";
+        const access = props.zugang || "unbekannt";
+        const km = props.rhein_km_nahe ? `km ${formatNumber(props.rhein_km_nahe, 3)}` : "km unbekannt";
+        const distance = Number.isFinite(Number(props.abstand_rhein_m)) ? `${Math.round(Number(props.abstand_rhein_m))} m zur Rheinlinie` : "Abstand unbekannt";
+        const note = props.hinweis || "Vor Ort prüfen.";
+        layer.bindPopup(`
+          <strong>${escapeHtml(kind)}: ${escapeHtml(title)}</strong><br>
+          <b>Kosten:</b> ${escapeHtml(cost)}<br>
+          <b>Zugang:</b> ${escapeHtml(access)}<br>
+          <small>${escapeHtml(km)} · ${escapeHtml(distance)}</small><br>
+          <small>${escapeHtml(note)}</small>
+        `);
+      } else {
+        layer.bindPopup(`<strong>${title}</strong>`);
+      }
     },
+  });
+}
+
+function accessIcon(type) {
+  const label = type === "boat" ? "⛵" : "P";
+  const className = type === "boat" ? "access-marker access-marker-boat" : "access-marker access-marker-parking";
+  return L.divIcon({
+    className,
+    html: `<span>${label}</span>`,
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
+    popupAnchor: [0, -14],
   });
 }
 
@@ -147,6 +185,7 @@ async function init() {
 
   state.overlays.erlaubnis.addTo(map);
   state.overlays.buhnen.addTo(map);
+  state.overlays.bootsslippen.addTo(map);
   state.overlays.sperrstrecken.addTo(map);
   state.overlays.rheinkm.addTo(map);
   state.savedSpotLayer = L.layerGroup().addTo(map);
@@ -227,7 +266,7 @@ function applyPanelState() {
 
 function renderLayerToggles() {
   const root = document.querySelector("#layerToggles");
-  for (const key of ["erlaubnis", "buhnen", "sperrstrecken", "schutz", "militaer", "rheinkm", "stationierung"]) {
+  for (const key of ["erlaubnis", "buhnen", "bootsslippen", "parkplaetze", "sperrstrecken", "schutz", "militaer", "rheinkm", "stationierung"]) {
     const label = document.createElement("label");
     const input = document.createElement("input");
     input.type = "checkbox";
