@@ -556,6 +556,104 @@ body[data-theme="system"] .spot-status.blocked {
   font-size: 1rem;
 }
 
+.recommendation-box,
+.catch-import {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--field-border);
+  border-radius: 14px;
+  background: var(--paper);
+}
+
+.recommendation-box h3 {
+  margin: 0 0 4px;
+  font-size: 1rem;
+}
+
+.recommendation-list {
+  display: grid;
+  gap: 9px;
+  margin-top: 8px;
+}
+
+.recommendation-card {
+  display: grid;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid var(--field-border);
+  border-radius: 12px;
+  background: var(--soft-bg);
+}
+
+.recommendation-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 900;
+}
+
+.recommendation-card small {
+  color: var(--muted);
+}
+
+.recommendation-bar {
+  height: 9px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(15, 73, 51, 0.14);
+}
+
+.recommendation-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #8fb341, #0d8b5f);
+}
+
+.recommendation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.recommendation-actions button,
+.recommendation-actions a {
+  border: 1px solid var(--field-border);
+  border-radius: 999px;
+  padding: 7px 9px;
+  background: var(--green-900);
+  color: #fff;
+  font-weight: 850;
+  text-decoration: none;
+}
+
+.recommendation-marker {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 3px solid #073b4c;
+  border-radius: 999px;
+  background: #30c3c9;
+  color: #073b4c;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.42);
+  font-weight: 950;
+}
+
+.recommendation-marker.r-good {
+  background: #3dd68c;
+}
+
+.recommendation-marker.r-medium {
+  background: #59c2ff;
+}
+
+.catch-import textarea {
+  width: 100%;
+  min-height: 92px;
+  resize: vertical;
+}
+
 .nav-links {
   display: flex;
   flex-wrap: wrap;

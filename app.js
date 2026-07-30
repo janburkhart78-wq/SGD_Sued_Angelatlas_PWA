@@ -21,6 +21,7 @@ const state = {
   factors: [],
   overlays: {},
   marker: null,
+  recommendationLayer: null,
   savedSpotLayer: null,
   currentSpot: null,
   panelCollapsed: false,
@@ -188,6 +189,7 @@ async function init() {
   state.overlays.bootsslippen.addTo(map);
   state.overlays.sperrstrecken.addTo(map);
   state.overlays.rheinkm.addTo(map);
+  state.recommendationLayer = L.layerGroup().addTo(map);
   state.savedSpotLayer = L.layerGroup().addTo(map);
   renderSavedSpots();
 
@@ -322,9 +324,11 @@ function inspectSpot(latlng) {
   const legalInfo = { riverKm, nearRiver, permissionByKm, sperreByKm, erlaubnisOk, gesperrt };
   const context = buildForecastContext({ nearestBuhne, legalInfo, warnkulisse });
   const forecast = evaluateForecast(context, species);
+  const recommendations = buildSpotRecommendations(latlng);
   state.currentSpot = { latlng, nearestStation, nearestBuhne, legalInfo, forecast };
 
-  renderResult({ latlng, nearestStation, nearestPermission, nearestBuhne, nearestSperre, schutzHits, militaerHits, forecast, legalInfo });
+  renderResult({ latlng, nearestStation, nearestPermission, nearestBuhne, nearestSperre, schutzHits, militaerHits, forecast, legalInfo, recommendations });
+  renderRecommendationMarkers(recommendations);
 }
 
 function buildForecastContext({ nearestBuhne, legalInfo, warnkulisse }) {
@@ -378,6 +382,13 @@ function evaluateForecast(rawContext, speciesName) {
     reasons.unshift("Erlaubnisstatus nicht eindeutig: vorsichtig abgewertet.");
   }
   if (warnings.length && !blocked) score = Math.round(score * 85) / 100;
+  if (!blocked) {
+    const boost = catchReportBoost(context, speciesName);
+    if (boost.points) {
+      score = Math.min(100, Math.round((score + boost.points) * 10) / 10);
+      reasons.unshift(boost.reason);
+    }
+  }
 
   return {
     species: speciesName,
@@ -387,6 +398,100 @@ function evaluateForecast(rawContext, speciesName) {
     reasons: reasons.slice(0, 10),
     context,
   };
+}
+
+function catchReportBoost(context, speciesName) {
+  const spot = context.latlng;
+  if (!spot) return { points: 0, reason: "" };
+  const dt = context.datetime ? new Date(context.datetime) : new Date();
+  const targetHour = dt.getHours();
+  const targetSeason = seasonForMonth(dt.getMonth() + 1);
+  let matches = 0;
+  let strong = 0;
+  for (const entry of getAllCatchReports()) {
+    if (String(entry.species || "").toLowerCase() !== String(speciesName).toLowerCase()) continue;
+    if (!Number.isFinite(Number(entry.lat)) || !Number.isFinite(Number(entry.lng))) continue;
+    const distance = haversine({ lat: spot.lat, lng: spot.lng }, { lat: Number(entry.lat), lng: Number(entry.lng) });
+    if (distance > 3000) continue;
+    const entryDate = entry.time ? new Date(entry.time) : null;
+    if (!entryDate || Number.isNaN(entryDate.valueOf())) continue;
+    const hourDiff = Math.min(Math.abs(entryDate.getHours() - targetHour), 24 - Math.abs(entryDate.getHours() - targetHour));
+    const seasonMatch = seasonForMonth(entryDate.getMonth() + 1) === targetSeason;
+    if (hourDiff <= 3 || seasonMatch) {
+      matches += 1;
+      if (distance <= 1200 && hourDiff <= 2) strong += 1;
+    }
+  }
+  if (strong >= 3) return { points: 8, reason: `Fangdaten-Bonus: ${strong} starke passende ${speciesName}-Meldungen im Umfeld/Zeitfenster.` };
+  if (strong >= 1) return { points: 5, reason: `Fangdaten-Bonus: passende ${speciesName}-Meldung nah am Spot/Zeitfenster.` };
+  if (matches >= 3) return { points: 4, reason: `Fangdaten-Bonus: mehrere ähnliche ${speciesName}-Meldungen im 3-km-Umfeld.` };
+  if (matches >= 1) return { points: 2, reason: `Fangdaten-Bonus: ähnliche ${speciesName}-Meldung im Umfeld.` };
+  return { points: 0, reason: "" };
+}
+
+function getAllCatchReports() {
+  return [...getCatchLog(), ...getImportedCatchReports()];
+}
+
+function getImportedCatchReports() {
+  try {
+    return JSON.parse(localStorage.getItem("angelatlas_import_fangmeldungen_v01") || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function importCatchReportsFromText() {
+  const input = document.querySelector("#catchImportInput");
+  const status = document.querySelector("#catchImportStatus");
+  if (!input || !status) return;
+  const rows = parseCatchImport(input.value);
+  if (!rows.length) {
+    status.textContent = "Keine gültigen Fangdaten erkannt.";
+    return;
+  }
+  const existing = getImportedCatchReports();
+  const merged = [...rows, ...existing].slice(0, 1000);
+  localStorage.setItem("angelatlas_import_fangmeldungen_v01", JSON.stringify(merged));
+  status.textContent = `${rows.length} Fangmeldung(en) importiert. Prognose nutzt sie ab dem nächsten Karten-Tipp.`;
+  input.value = "";
+}
+
+function parseCatchImport(text) {
+  return String(text || "").split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const cols = line.includes(";") ? line.split(";") : line.split(",");
+      const [species, time, lat, lng, size] = cols.map((value) => String(value || "").trim());
+      const latNum = Number(String(lat).replace(",", "."));
+      const lngNum = Number(String(lng).replace(",", "."));
+      if (!species || !time || !Number.isFinite(latNum) || !Number.isFinite(lngNum)) return null;
+      return {
+        id: Date.now() + Math.round(Math.random() * 100000),
+        species,
+        time: normalizeImportDate(time),
+        lat: Number(latNum.toFixed(7)),
+        lng: Number(lngNum.toFixed(7)),
+        size_cm: Number.isFinite(Number(size)) ? Number(size) : null,
+        source: "import",
+      };
+    })
+    .filter(Boolean);
+}
+
+function normalizeImportDate(value) {
+  const text = String(value || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(text)) return text.slice(0, 16);
+  const normalized = text.replace(" ", "T");
+  const date = new Date(normalized);
+  if (!Number.isNaN(date.valueOf())) return localDatetimeValue(date);
+  const match = text.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})/);
+  if (match) {
+    const [, d, m, y, h, min] = match;
+    return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}T${String(h).padStart(2, "0")}:${min}`;
+  }
+  return localDatetimeValue(new Date());
 }
 
 function enrichContext(context) {
@@ -416,6 +521,100 @@ function expandContextForSpecies(context, species) {
     if (["Barbe", "Doebel"].includes(species)) { values.add("stroemung"); values.add("kante"); }
   }
   return { ...context, struktur: [...values].sort().join(",") };
+}
+
+function buildSpotRecommendations(originLatLng) {
+  const candidates = candidateStationPoints(originLatLng, 2500);
+  const results = [];
+  for (const candidate of candidates) {
+    const latlng = candidate.latlng;
+    const nearestPermission = nearestFeature(latlng, state.geo.erlaubnis);
+    const nearestBuhne = nearestFeature(latlng, state.geo.buhnen);
+    const nearestSperre = nearestFeature(latlng, state.geo.sperrstrecken);
+    const schutzHits = containingFeatures(latlng, state.geo.schutz);
+    const militaerHits = containingFeatures(latlng, state.geo.militaer);
+    const riverKm = Number(candidate.feature.properties.station_km);
+    const permissionByKm = findKmRange(riverKm, state.geo.erlaubnis, 0.015);
+    const sperreByKm = findKmRange(riverKm, state.geo.sperrstrecken, 0.015);
+    const legalInfo = {
+      riverKm,
+      nearRiver: true,
+      permissionByKm,
+      sperreByKm,
+      erlaubnisOk: Boolean(permissionByKm) && nearestPermission.distanceM <= 650,
+      gesperrt: Boolean(sperreByKm) || nearestSperre.distanceM <= 120,
+    };
+    if (!legalInfo.erlaubnisOk || legalInfo.gesperrt) continue;
+    const warnkulisse = schutzHits.length > 0 || militaerHits.length > 0;
+    const baseContext = buildForecastContext({ nearestBuhne, legalInfo, warnkulisse });
+    baseContext.latlng = latlng;
+    const best = bestSpeciesForecastForNextTwoHours(baseContext);
+    if (!best) continue;
+    results.push({
+      latlng,
+      rhein_km: riverKm,
+      distance_m: Math.round(candidate.distanceM),
+      buhne_m: Math.round(nearestBuhne.distanceM),
+      schutz_count: schutzHits.length,
+      militaer_count: militaerHits.length,
+      forecast: best,
+    });
+  }
+  results.sort((a, b) => b.forecast.score - a.forecast.score || a.distance_m - b.distance_m);
+  return diversifyRecommendations(results, 5, 280);
+}
+
+function candidateStationPoints(originLatLng, radiusM) {
+  const candidates = [];
+  const usedKm = new Set();
+  for (const feature of state.geo.stationierung.features || []) {
+    if (feature.geometry?.type !== "Point") continue;
+    const [lng, lat] = feature.geometry.coordinates;
+    const latlng = L.latLng(lat, lng);
+    const distanceM = haversine(originLatLng, latlng);
+    if (distanceM > radiusM) continue;
+    const km = Number(feature.properties?.station_km);
+    const bucket = Number.isFinite(km) ? Math.round(km * 5) / 5 : Math.round(distanceM / 250);
+    if (usedKm.has(bucket)) continue;
+    usedKm.add(bucket);
+    candidates.push({ feature, latlng, distanceM });
+  }
+  candidates.sort((a, b) => a.distanceM - b.distanceM);
+  return candidates.slice(0, 36);
+}
+
+function bestSpeciesForecastForNextTwoHours(baseContext) {
+  const speciesNames = Object.keys(state.species);
+  const baseDate = baseContext.datetime ? new Date(baseContext.datetime) : new Date();
+  let best = null;
+  for (const species of speciesNames) {
+    const forecasts = [0, 1, 2].map((hours) => {
+      const nextDate = new Date(baseDate.getTime() + hours * 60 * 60 * 1000);
+      const context = { ...baseContext, datetime: localDatetimeValue(nextDate) };
+      return evaluateForecast(context, species);
+    });
+    const average = Math.round((forecasts.reduce((sum, f) => sum + f.score, 0) / forecasts.length) * 10) / 10;
+    const combined = {
+      ...forecasts[0],
+      score: average,
+      rating: rating(average, forecasts[0].rating === "gesperrt"),
+      reasons: [...new Set(forecasts.flatMap((f) => f.reasons))].slice(0, 5),
+      warnings: [...new Set(forecasts.flatMap((f) => f.warnings))],
+    };
+    if (!best || combined.score > best.score) best = combined;
+  }
+  return best;
+}
+
+function diversifyRecommendations(results, limit, minDistanceM) {
+  const selected = [];
+  for (const item of results) {
+    if (selected.every((existing) => haversine(item.latlng, existing.latlng) >= minDistanceM)) {
+      selected.push(item);
+      if (selected.length >= limit) break;
+    }
+  }
+  return selected;
 }
 
 function temperatureScore(value, profile) {
@@ -516,7 +715,7 @@ function pressureAnalysis(text) {
 }
 
 function renderResult(data) {
-  const { latlng, nearestStation, nearestPermission, nearestBuhne, nearestSperre, schutzHits, militaerHits, forecast, legalInfo } = data;
+  const { latlng, nearestStation, nearestPermission, nearestBuhne, nearestSperre, schutzHits, militaerHits, forecast, legalInfo, recommendations = [] } = data;
   const google = `https://www.google.com/maps/search/?api=1&query=${latlng.lat.toFixed(7)},${latlng.lng.toFixed(7)}`;
   const waze = `https://waze.com/ul?ll=${latlng.lat.toFixed(7)},${latlng.lng.toFixed(7)}&navigate=yes`;
   const result = document.querySelector("#result");
@@ -564,12 +763,15 @@ function renderResult(data) {
       <a href="${google}" target="_blank" rel="noopener">Google Maps</a>
       <a href="${waze}" target="_blank" rel="noopener">Waze</a>
     </div>
+    ${recommendationsHtml(recommendations)}
     ${savedSpotControlsHtml()}
+    ${catchImportHtml()}
     ${catchFormHtml(forecast.species)}
     <div id="catchSaveStatus" class="save-status" aria-live="polite"></div>
     <div id="catchLog" class="catch-log"></div>
   `;
   document.querySelector("#spotSaveBtn").addEventListener("click", saveCurrentSpot);
+  document.querySelector("#catchImportBtn").addEventListener("click", importCatchReportsFromText);
   document.querySelector("#catchTimeInput").value = localDatetimeValue(new Date());
   document.querySelector("#catchSaveBtn").addEventListener("click", saveCatchReport);
   renderSavedSpotList();
@@ -587,6 +789,92 @@ function spotStatus(erlaubnisstatus, legalInfo) {
     return { className: "outside", text: "Vorprüfung: außerhalb der Rhein-Erlaubnis" };
   }
   return { className: "unknown", text: "Vorprüfung: unklar, vor Ort prüfen" };
+}
+
+function recommendationsHtml(recommendations) {
+  if (!recommendations.length) {
+    return `
+      <section class="recommendation-box">
+        <h3>Top-Spots im 2,5-km-Umkreis</h3>
+        <p class="legal-note">Keine sicheren Vorschläge gefunden. Prüfe Standort, Erlaubnisstrecke und Sperrkulissen.</p>
+      </section>
+    `;
+  }
+  return `
+    <section class="recommendation-box">
+      <h3>Top-Spots nächste 2 h</h3>
+      <p class="panel-mini">Beste 4–5 erlaubte Kandidaten im Umkreis von 2,5 km.</p>
+      <div class="recommendation-list">
+        ${recommendations.map((item, index) => {
+          const google = `https://www.google.com/maps/search/?api=1&query=${item.latlng.lat.toFixed(7)},${item.latlng.lng.toFixed(7)}`;
+          const score = Math.max(0, Math.min(100, Number(item.forecast.score) || 0));
+          return `
+            <article class="recommendation-card">
+              <div class="recommendation-head">
+                <strong>${index + 1}. ${escapeHtml(item.forecast.species)}</strong>
+                <span>${formatNumber(score, 1)}/100</span>
+              </div>
+              <div class="recommendation-bar"><i style="width:${score}%"></i></div>
+              <small>km ${formatNumber(item.rhein_km, 3)} · ${item.distance_m} m entfernt · Buhne ${item.buhne_m} m</small>
+              <div class="recommendation-actions">
+                <button type="button" data-rec-goto="${index}">zeigen</button>
+                <a href="${google}" target="_blank" rel="noopener">Maps</a>
+              </div>
+            </article>
+          `;
+        }).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderRecommendationMarkers(recommendations) {
+  if (!state.recommendationLayer) return;
+  state.recommendationLayer.clearLayers();
+  recommendations.forEach((item, index) => {
+    const marker = L.marker(item.latlng, {
+      icon: recommendationIcon(index + 1, item.forecast.rating),
+      title: `${item.forecast.species} ${item.forecast.score}/100`,
+    });
+    marker.bindPopup(`
+      <strong>${index + 1}. ${escapeHtml(item.forecast.species)} · ${formatNumber(item.forecast.score, 1)}/100</strong><br>
+      km ${formatNumber(item.rhein_km, 3)} · ${item.distance_m} m entfernt<br>
+      Buhne ${item.buhne_m} m
+    `);
+    marker.addTo(state.recommendationLayer);
+  });
+  setTimeout(() => {
+    document.querySelectorAll("[data-rec-goto]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const item = recommendations[Number(button.dataset.recGoto)];
+        if (!item) return;
+        map.setView(item.latlng, Math.max(map.getZoom(), 16));
+        inspectSpot(item.latlng);
+      });
+    });
+  }, 0);
+}
+
+function recommendationIcon(number, ratingName) {
+  return L.divIcon({
+    className: `recommendation-marker ${ratingName || ""}`,
+    html: `<span>${number}</span>`,
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
+    popupAnchor: [0, -15],
+  });
+}
+
+function catchImportHtml() {
+  return `
+    <details class="catch-import">
+      <summary>Fangdaten importieren</summary>
+      <p class="panel-mini">CSV/Text je Zeile: Art;Datum/Zeit;Lat;Lng;Größe. Optional geht Komma statt Semikolon.</p>
+      <textarea id="catchImportInput" rows="4" placeholder="Zander;2026-07-25 21:30;49.12345;8.12345;62"></textarea>
+      <button id="catchImportBtn" class="secondary-button" type="button">Fangdaten übernehmen</button>
+      <div id="catchImportStatus" class="save-status" aria-live="polite"></div>
+    </details>
+  `;
 }
 
 function catchFormHtml(species) {
