@@ -1,4 +1,4 @@
-const CACHE_NAME = "sgd-angelatlas-pwa-v14";
+const CACHE_NAME = "sgd-angelatlas-pwa-v15";
 const APP_SHELL = [
   "./",
   "./index.html",

@@ -9,6 +9,7 @@ const DATA = {
   schutz: "data/geojson/schutzgebiete_korridor_352_438.geojson",
   militaer: "data/geojson/osm_militaer_korridor_352_438.geojson",
   korridor: "data/geojson/erlaubnis_korridor_3000m.geojson",
+  wasser: "data/geojson/wasserflaechen_spots_352_438.geojson",
 };
 
 const CONFIG = {
@@ -525,7 +526,8 @@ function expandContextForSpecies(context, species) {
 }
 
 function buildSpotRecommendations(originLatLng, targetSpecies) {
-  const candidates = candidateRecommendationPoints(originLatLng, 2500);
+  const fishingBankSign = configuredFishingBankSign();
+  const candidates = candidateRecommendationPoints(originLatLng, 2500, fishingBankSign);
   const results = [];
   for (const candidate of candidates) {
     const latlng = candidate.latlng;
@@ -537,29 +539,30 @@ function buildSpotRecommendations(originLatLng, targetSpecies) {
     const riverKm = Number(candidate.feature.properties.station_km);
     const permissionByKm = findKmRange(riverKm, state.geo.erlaubnis, candidate.kind === "altrhein_umfeld" ? 0.08 : 0.015);
     const sperreByKm = findKmRange(riverKm, state.geo.sperrstrecken, 0.015);
-    const permissionSide = String(permissionByKm?.properties?.seite || "").toLowerCase();
-    const sameBankAsStart = candidate.side === 0 || candidate.originSide === 0 || Math.sign(candidate.side) === Math.sign(candidate.originSide);
+    const permissionSide = String(nearestPermission.feature?.properties?.seite || permissionByKm?.properties?.seite || "").toLowerCase();
+    const leftBankOk = isOnConfiguredFishingBank(latlng, fishingBankSign);
+    const onWater = isWaterCandidate(latlng, candidate.kind);
     const leftOrUnknownPermission = !permissionSide || permissionSide === "links";
-    const inSearchCorridor = !state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length > 0 || nearestPermission.distanceM <= 900;
+    const inSearchCorridor = !state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length > 0 || nearestPermission.distanceM <= 650;
     const legalInfo = {
       riverKm,
-      nearRiver: nearestPermission.distanceM <= 900,
+      nearRiver: nearestPermission.distanceM <= 650,
       permissionByKm,
       sperreByKm,
-      erlaubnisOk: Boolean(permissionByKm) && leftOrUnknownPermission && sameBankAsStart && inSearchCorridor,
+      erlaubnisOk: Boolean(permissionByKm) && leftOrUnknownPermission && leftBankOk && onWater && inSearchCorridor,
       gesperrt: Boolean(sperreByKm) || nearestSperre.distanceM <= 120,
     };
     if (!legalInfo.erlaubnisOk || legalInfo.gesperrt) continue;
     const warnkulisse = schutzHits.length > 0 || militaerHits.length > 0;
     const baseContext = buildForecastContext({ nearestBuhne, legalInfo, warnkulisse });
     baseContext.latlng = latlng;
-    if (candidate.kind === "altrhein_umfeld") {
+    if (candidate.kind === "wasserflaeche") {
       baseContext.struktur = [baseContext.struktur, "altrhein", "kante", "ruhiges_wasser"].filter(Boolean).join(",");
     }
     const best = bestSpeciesForecastForNextTwoHours(baseContext, targetSpecies);
     if (!best) continue;
-    if (candidate.kind === "altrhein_umfeld") {
-      best.warnings = [...new Set([...(best.warnings || []), "Altrhein-/Umfeld-Vorschlag: Erlaubnis und örtliche Beschilderung prüfen."])];
+    if (candidate.kind === "wasserflaeche") {
+      best.warnings = [...new Set([...(best.warnings || []), "Wasserflächen-Vorschlag: Erlaubnis und örtliche Beschilderung prüfen."])];
     }
     results.push({
       latlng,
@@ -576,12 +579,12 @@ function buildSpotRecommendations(originLatLng, targetSpecies) {
   return diversifyRecommendations(results, 5, 280);
 }
 
-function candidateRecommendationPoints(originLatLng, radiusM) {
-  const originSide = riverSideSign(originLatLng);
+function candidateRecommendationPoints(originLatLng, radiusM, fishingBankSign = configuredFishingBankSign()) {
+  const originSide = fishingBankSign;
   const candidates = [
     ...candidateBankStationPoints(originLatLng, radiusM, originSide),
     ...candidateBuhnePoints(originLatLng, radiusM, originSide),
-    ...candidateAltrheinGridPoints(originLatLng, radiusM, originSide),
+    ...candidateWaterAreaPoints(originLatLng, radiusM, originSide),
   ];
   const seen = new Set();
   return candidates
@@ -593,7 +596,7 @@ function candidateRecommendationPoints(originLatLng, radiusM) {
       return true;
     })
     .sort((a, b) => {
-      const priority = { buhne: 0, altrhein_umfeld: 1, ufer: 2 };
+      const priority = { buhne: 0, wasserflaeche: 1, ufer: 2 };
       return (priority[a.kind] ?? 9) - (priority[b.kind] ?? 9) || a.distanceM - b.distanceM;
     })
     .slice(0, 90);
@@ -648,27 +651,27 @@ function candidateBuhnePoints(originLatLng, radiusM, originSide) {
   return candidates.slice(0, 36);
 }
 
-function candidateAltrheinGridPoints(originLatLng, radiusM, originSide) {
+function candidateWaterAreaPoints(originLatLng, radiusM, originSide) {
   const candidates = [];
-  const stepM = 300;
-  for (let north = -radiusM; north <= radiusM; north += stepM) {
-    for (let east = -radiusM; east <= radiusM; east += stepM) {
-      if (Math.hypot(east, north) > radiusM) continue;
-      if (Math.abs(east) < 80 && Math.abs(north) < 80) continue;
-      const latlng = offsetLatLng(originLatLng, east, north);
+  for (const water of state.geo.wasser?.features || []) {
+    const points = waterCandidatePoints(water.geometry, originLatLng);
+    for (const latlng of points) {
+      const distanceM = haversine(originLatLng, latlng);
+      if (distanceM > radiusM) continue;
       const side = riverSideSign(latlng);
       if (originSide && side && Math.sign(side) !== Math.sign(originSide)) continue;
       const nearestPermission = nearestFeature(latlng, state.geo.erlaubnis);
-      if (nearestPermission.distanceM > 900 && (!state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length === 0)) continue;
+      if (nearestPermission.distanceM > 650 && (!state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length === 0)) continue;
       const nearestStation = nearestFeature(latlng, state.geo.stationierung);
       const stationKm = Number(nearestStation.feature?.properties?.station_km);
       if (!Number.isFinite(stationKm)) continue;
+      const typ = water.properties?.typ || "Wasser";
       candidates.push({
         feature: { type: "Feature", properties: { station_km: stationKm } },
         latlng,
-        distanceM: haversine(originLatLng, latlng),
-        kind: "altrhein_umfeld",
-        label: "Altrhein/Umfeld im Suchradius",
+        distanceM,
+        kind: "wasserflaeche",
+        label: `${typ}/Wasserfläche`,
         side,
         originSide,
       });
@@ -676,6 +679,84 @@ function candidateAltrheinGridPoints(originLatLng, radiusM, originSide) {
   }
   candidates.sort((a, b) => a.distanceM - b.distanceM);
   return candidates.slice(0, 36);
+}
+
+function waterCandidatePoints(geom, originLatLng) {
+  const points = [];
+  const center = representativePoint(geom);
+  if (center) points.push(center);
+  if (geom?.type === "Polygon") {
+    points.push(...ringCandidatePoints(geom.coordinates?.[0] || [], originLatLng));
+  } else if (geom?.type === "MultiPolygon") {
+    for (const polygon of geom.coordinates || []) points.push(...ringCandidatePoints(polygon?.[0] || [], originLatLng));
+  }
+  return points.filter(Boolean);
+}
+
+function ringCandidatePoints(ring, originLatLng) {
+  if (!ring.length) return [];
+  const candidates = [];
+  let best = null;
+  let bestDistance = Infinity;
+  const stride = Math.max(1, Math.floor(ring.length / 16));
+  for (let i = 0; i < ring.length; i += stride) {
+    const point = L.latLng(ring[i][1], ring[i][0]);
+    candidates.push(point);
+    const d = haversine(originLatLng, point);
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = point;
+    }
+  }
+  if (best) candidates.unshift(best);
+  return candidates;
+}
+
+function configuredFishingBankSign() {
+  const signs = [];
+  for (const feature of state.geo.erlaubnis.features || []) {
+    const side = String(feature.properties?.seite || "").toLowerCase();
+    if (side && side !== "links") continue;
+    for (const latlng of geometrySampleLatLngs(feature.geometry, 20)) {
+      const sign = riverSideSign(latlng);
+      if (sign) signs.push(sign);
+    }
+  }
+  const sum = signs.reduce((total, sign) => total + Math.sign(sign), 0);
+  return sum < 0 ? -1 : 1;
+}
+
+function isOnConfiguredFishingBank(latlng, expected = configuredFishingBankSign()) {
+  const sign = riverSideSign(latlng);
+  if (!expected || !sign) return true;
+  return Math.sign(sign) === Math.sign(expected);
+}
+
+function isWaterCandidate(latlng, kind) {
+  if (kind === "buhne") return distanceToWater(latlng) <= 90;
+  if (kind === "ufer") return distanceToWater(latlng) <= 120;
+  if (kind === "wasserflaeche") return containingFeatures(latlng, state.geo.wasser).length > 0 || distanceToWater(latlng) <= 40;
+  return distanceToWater(latlng) <= 80;
+}
+
+function distanceToWater(latlng) {
+  if (!state.geo.wasser) return Infinity;
+  return nearestFeature(latlng, state.geo.wasser).distanceM;
+}
+
+function geometrySampleLatLngs(geom, maxPoints = 12) {
+  const coords = [];
+  const collectLine = (line) => {
+    if (!line?.length) return;
+    const stride = Math.max(1, Math.floor(line.length / maxPoints));
+    for (let i = 0; i < line.length; i += stride) coords.push(line[i]);
+  };
+  if (geom?.type === "LineString") collectLine(geom.coordinates);
+  else if (geom?.type === "MultiLineString") (geom.coordinates || []).forEach(collectLine);
+  else if (geom?.type === "Polygon") collectLine(geom.coordinates?.[0] || []);
+  else if (geom?.type === "MultiPolygon") (geom.coordinates || []).forEach((poly) => collectLine(poly?.[0] || []));
+  else if (geom?.type === "Point") coords.push(geom.coordinates);
+  return coords.filter(Boolean).map(([lng, lat]) => L.latLng(lat, lng));
 }
 
 function representativePoint(geom) {
