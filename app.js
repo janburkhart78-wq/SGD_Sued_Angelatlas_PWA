@@ -10,6 +10,7 @@ const DATA = {
   militaer: "data/geojson/osm_militaer_korridor_352_438.geojson",
   korridor: "data/geojson/erlaubnis_korridor_3000m.geojson",
   wasser: "data/geojson/wasserflaechen_spots_352_438.geojson",
+  rlp: "data/geojson/rlp_landmaske.geojson",
 };
 
 const CONFIG = {
@@ -319,7 +320,8 @@ function inspectSpot(latlng) {
   const nearRiver = nearestStation.distanceM <= 650;
   const permissionByKm = findKmRange(riverKm, state.geo.erlaubnis, 0.015);
   const sperreByKm = findKmRange(riverKm, state.geo.sperrstrecken, 0.015);
-  const erlaubnisOk = nearRiver && Boolean(permissionByKm) && nearestPermission.distanceM <= 650;
+  const inRlp = isInRlp(latlng);
+  const erlaubnisOk = nearRiver && Boolean(permissionByKm) && nearestPermission.distanceM <= 650 && inRlp;
   const gesperrt = nearRiver && (Boolean(sperreByKm) || nearestSperre.distanceM <= 120);
   const warnkulisse = schutzHits.length > 0 || militaerHits.length > 0;
   const species = document.querySelector("#speciesSelect").value;
@@ -545,12 +547,13 @@ function buildSpotRecommendations(originLatLng, targetSpecies) {
     const leftOrUnknownPermission = !permissionSide || permissionSide === "links";
     const inSearchCorridor = !state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length > 0 || nearestPermission.distanceM <= 650;
     const westOfRhine = isWestOfRhineCenter(latlng);
+    const inRlp = isInRlp(latlng);
     const legalInfo = {
       riverKm,
       nearRiver: nearestPermission.distanceM <= 650,
       permissionByKm,
       sperreByKm,
-      erlaubnisOk: Boolean(permissionByKm) && leftOrUnknownPermission && leftBankOk && onWater && inSearchCorridor && westOfRhine,
+      erlaubnisOk: Boolean(permissionByKm) && leftOrUnknownPermission && leftBankOk && onWater && inSearchCorridor && westOfRhine && inRlp,
       gesperrt: Boolean(sperreByKm) || nearestSperre.distanceM <= 120,
     };
     if (!legalInfo.erlaubnisOk || legalInfo.gesperrt) continue;
@@ -660,6 +663,7 @@ function candidateWaterAreaPoints(originLatLng, radiusM) {
       const distanceM = haversine(originLatLng, latlng);
       if (distanceM > radiusM) continue;
       if (!isWestOfRhineCenter(latlng)) continue;
+      if (!isInRlp(latlng)) continue;
       const nearestLeftPermission = nearestLeftPermissionFeature(latlng);
       if (nearestLeftPermission.distanceM > 650 && (!state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length === 0)) continue;
       const nearestStation = nearestFeature(latlng, state.geo.stationierung);
@@ -743,6 +747,11 @@ function isWestOfRhineCenter(latlng) {
   if (!coords) return false;
   const stationLng = coords[0];
   return latlng.lng <= stationLng + 0.00015;
+}
+
+function isInRlp(latlng) {
+  if (!state.geo.rlp) return true;
+  return containingFeatures(latlng, state.geo.rlp).length > 0;
 }
 
 function distanceToWater(latlng) {
