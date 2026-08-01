@@ -531,7 +531,7 @@ function buildSpotRecommendations(originLatLng, targetSpecies) {
   const results = [];
   for (const candidate of candidates) {
     const latlng = candidate.latlng;
-    const nearestPermission = nearestFeature(latlng, state.geo.erlaubnis);
+    const nearestPermission = nearestLeftPermissionFeature(latlng);
     const nearestBuhne = nearestFeature(latlng, state.geo.buhnen);
     const nearestSperre = nearestFeature(latlng, state.geo.sperrstrecken);
     const schutzHits = containingFeatures(latlng, state.geo.schutz);
@@ -540,7 +540,7 @@ function buildSpotRecommendations(originLatLng, targetSpecies) {
     const permissionByKm = findKmRange(riverKm, state.geo.erlaubnis, candidate.kind === "altrhein_umfeld" ? 0.08 : 0.015);
     const sperreByKm = findKmRange(riverKm, state.geo.sperrstrecken, 0.015);
     const permissionSide = String(nearestPermission.feature?.properties?.seite || permissionByKm?.properties?.seite || "").toLowerCase();
-    const leftBankOk = isOnConfiguredFishingBank(latlng, fishingBankSign);
+    const leftBankOk = nearestPermission.distanceM <= 650;
     const onWater = isWaterCandidate(latlng, candidate.kind);
     const leftOrUnknownPermission = !permissionSide || permissionSide === "links";
     const inSearchCorridor = !state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length > 0 || nearestPermission.distanceM <= 650;
@@ -580,11 +580,9 @@ function buildSpotRecommendations(originLatLng, targetSpecies) {
 }
 
 function candidateRecommendationPoints(originLatLng, radiusM, fishingBankSign = configuredFishingBankSign()) {
-  const originSide = fishingBankSign;
   const candidates = [
-    ...candidateBankStationPoints(originLatLng, radiusM, originSide),
-    ...candidateBuhnePoints(originLatLng, radiusM, originSide),
-    ...candidateWaterAreaPoints(originLatLng, radiusM, originSide),
+    ...candidatePermissionLinePoints(originLatLng, radiusM),
+    ...candidateWaterAreaPoints(originLatLng, radiusM),
   ];
   const seen = new Set();
   return candidates
@@ -596,31 +594,34 @@ function candidateRecommendationPoints(originLatLng, radiusM, fishingBankSign = 
       return true;
     })
     .sort((a, b) => {
-      const priority = { buhne: 0, wasserflaeche: 1, ufer: 2 };
+      const priority = { erlaubnislinie: 0, wasserflaeche: 1 };
       return (priority[a.kind] ?? 9) - (priority[b.kind] ?? 9) || a.distanceM - b.distanceM;
     })
     .slice(0, 90);
 }
 
-function candidateBankStationPoints(originLatLng, radiusM, originSide) {
+function candidatePermissionLinePoints(originLatLng, radiusM) {
   const candidates = [];
   const usedKm = new Set();
-  const features = state.geo.stationierung.features || [];
-  for (let index = 0; index < features.length; index += 1) {
-    const feature = features[index];
-    if (feature.geometry?.type !== "Point") continue;
-    const [lng, lat] = feature.geometry.coordinates;
-    const riverPoint = L.latLng(lat, lng);
-    const latlng = offsetStationPoint(index, originSide || -1, 75) || riverPoint;
-    const distanceM = haversine(originLatLng, latlng);
-    if (distanceM > radiusM) continue;
-    const side = riverSideSign(latlng);
-    if (originSide && side && Math.sign(side) !== Math.sign(originSide)) continue;
-    const km = Number(feature.properties?.station_km);
-    const bucket = Number.isFinite(km) ? Math.round(km * 5) / 5 : Math.round(distanceM / 250);
-    if (usedKm.has(bucket)) continue;
-    usedKm.add(bucket);
-    candidates.push({ feature, latlng, distanceM, kind: "ufer", label: "linkes Ufer/Erlaubniskante", side, originSide });
+  for (const feature of state.geo.erlaubnis.features || []) {
+    const side = String(feature.properties?.seite || "").toLowerCase();
+    if (side && side !== "links") continue;
+    for (const latlng of geometrySampleLatLngs(feature.geometry, 48)) {
+      const distanceM = haversine(originLatLng, latlng);
+      if (distanceM > radiusM) continue;
+      const nearestStation = nearestFeature(latlng, state.geo.stationierung);
+      const km = Number(nearestStation.feature?.properties?.station_km);
+      const bucket = Number.isFinite(km) ? Math.round(km * 5) / 5 : Math.round(distanceM / 250);
+      if (usedKm.has(bucket)) continue;
+      usedKm.add(bucket);
+      candidates.push({
+        feature: { type: "Feature", properties: { station_km: km } },
+        latlng,
+        distanceM,
+        kind: "erlaubnislinie",
+        label: "Erlaubnislinie linke Rheinseite",
+      });
+    }
   }
   candidates.sort((a, b) => a.distanceM - b.distanceM);
   return candidates.slice(0, 40);
@@ -651,17 +652,15 @@ function candidateBuhnePoints(originLatLng, radiusM, originSide) {
   return candidates.slice(0, 36);
 }
 
-function candidateWaterAreaPoints(originLatLng, radiusM, originSide) {
+function candidateWaterAreaPoints(originLatLng, radiusM) {
   const candidates = [];
   for (const water of state.geo.wasser?.features || []) {
     const points = waterCandidatePoints(water.geometry, originLatLng);
     for (const latlng of points) {
       const distanceM = haversine(originLatLng, latlng);
       if (distanceM > radiusM) continue;
-      const side = riverSideSign(latlng);
-      if (originSide && side && Math.sign(side) !== Math.sign(originSide)) continue;
-      const nearestPermission = nearestFeature(latlng, state.geo.erlaubnis);
-      if (nearestPermission.distanceM > 650 && (!state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length === 0)) continue;
+      const nearestLeftPermission = nearestLeftPermissionFeature(latlng);
+      if (nearestLeftPermission.distanceM > 650 && (!state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length === 0)) continue;
       const nearestStation = nearestFeature(latlng, state.geo.stationierung);
       const stationKm = Number(nearestStation.feature?.properties?.station_km);
       if (!Number.isFinite(stationKm)) continue;
@@ -672,8 +671,6 @@ function candidateWaterAreaPoints(originLatLng, radiusM, originSide) {
         distanceM,
         kind: "wasserflaeche",
         label: `${typ}/Wasserfläche`,
-        side,
-        originSide,
       });
     }
   }
@@ -1401,6 +1398,17 @@ function nearestFeature(latlng, geojson) {
     if (d < best.distanceM) best = { feature, distanceM: d };
   }
   return best;
+}
+
+function nearestLeftPermissionFeature(latlng) {
+  let best = { feature: null, distanceM: Infinity };
+  for (const feature of state.geo.erlaubnis.features || []) {
+    const side = String(feature.properties?.seite || "").toLowerCase();
+    if (side && side !== "links") continue;
+    const d = distanceToGeometry(latlng, feature.geometry);
+    if (d < best.distanceM) best = { feature, distanceM: d };
+  }
+  return best.feature ? best : nearestFeature(latlng, state.geo.erlaubnis);
 }
 
 function containingFeatures(latlng, geojson) {
