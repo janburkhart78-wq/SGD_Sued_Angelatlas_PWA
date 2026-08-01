@@ -8,6 +8,7 @@ const DATA = {
   sperrstrecken: "data/geojson/erlaubnis_sperrstrecken_2026.geojson",
   schutz: "data/geojson/schutzgebiete_korridor_352_438.geojson",
   militaer: "data/geojson/osm_militaer_korridor_352_438.geojson",
+  korridor: "data/geojson/erlaubnis_korridor_3000m.geojson",
 };
 
 const CONFIG = {
@@ -324,7 +325,7 @@ function inspectSpot(latlng) {
   const legalInfo = { riverKm, nearRiver, permissionByKm, sperreByKm, erlaubnisOk, gesperrt };
   const context = buildForecastContext({ nearestBuhne, legalInfo, warnkulisse });
   const forecast = evaluateForecast(context, species);
-  const recommendations = buildSpotRecommendations(latlng);
+  const recommendations = buildSpotRecommendations(latlng, species);
   state.currentSpot = { latlng, nearestStation, nearestBuhne, legalInfo, forecast };
 
   renderResult({ latlng, nearestStation, nearestPermission, nearestBuhne, nearestSperre, schutzHits, militaerHits, forecast, legalInfo, recommendations });
@@ -523,8 +524,8 @@ function expandContextForSpecies(context, species) {
   return { ...context, struktur: [...values].sort().join(",") };
 }
 
-function buildSpotRecommendations(originLatLng) {
-  const candidates = candidateStationPoints(originLatLng, 2500);
+function buildSpotRecommendations(originLatLng, targetSpecies) {
+  const candidates = candidateRecommendationPoints(originLatLng, 2500);
   const results = [];
   for (const candidate of candidates) {
     const latlng = candidate.latlng;
@@ -534,22 +535,32 @@ function buildSpotRecommendations(originLatLng) {
     const schutzHits = containingFeatures(latlng, state.geo.schutz);
     const militaerHits = containingFeatures(latlng, state.geo.militaer);
     const riverKm = Number(candidate.feature.properties.station_km);
-    const permissionByKm = findKmRange(riverKm, state.geo.erlaubnis, 0.015);
+    const permissionByKm = findKmRange(riverKm, state.geo.erlaubnis, candidate.kind === "altrhein_umfeld" ? 0.08 : 0.015);
     const sperreByKm = findKmRange(riverKm, state.geo.sperrstrecken, 0.015);
+    const permissionSide = String(permissionByKm?.properties?.seite || "").toLowerCase();
+    const sameBankAsStart = candidate.side === 0 || candidate.originSide === 0 || Math.sign(candidate.side) === Math.sign(candidate.originSide);
+    const leftOrUnknownPermission = !permissionSide || permissionSide === "links";
+    const inSearchCorridor = !state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length > 0 || nearestPermission.distanceM <= 900;
     const legalInfo = {
       riverKm,
-      nearRiver: true,
+      nearRiver: nearestPermission.distanceM <= 900,
       permissionByKm,
       sperreByKm,
-      erlaubnisOk: Boolean(permissionByKm) && nearestPermission.distanceM <= 650,
+      erlaubnisOk: Boolean(permissionByKm) && leftOrUnknownPermission && sameBankAsStart && inSearchCorridor,
       gesperrt: Boolean(sperreByKm) || nearestSperre.distanceM <= 120,
     };
     if (!legalInfo.erlaubnisOk || legalInfo.gesperrt) continue;
     const warnkulisse = schutzHits.length > 0 || militaerHits.length > 0;
     const baseContext = buildForecastContext({ nearestBuhne, legalInfo, warnkulisse });
     baseContext.latlng = latlng;
-    const best = bestSpeciesForecastForNextTwoHours(baseContext);
+    if (candidate.kind === "altrhein_umfeld") {
+      baseContext.struktur = [baseContext.struktur, "altrhein", "kante", "ruhiges_wasser"].filter(Boolean).join(",");
+    }
+    const best = bestSpeciesForecastForNextTwoHours(baseContext, targetSpecies);
     if (!best) continue;
+    if (candidate.kind === "altrhein_umfeld") {
+      best.warnings = [...new Set([...(best.warnings || []), "Altrhein-/Umfeld-Vorschlag: Erlaubnis und örtliche Beschilderung prüfen."])];
+    }
     results.push({
       latlng,
       rhein_km: riverKm,
@@ -557,6 +568,7 @@ function buildSpotRecommendations(originLatLng) {
       buhne_m: Math.round(nearestBuhne.distanceM),
       schutz_count: schutzHits.length,
       militaer_count: militaerHits.length,
+      source_label: candidate.label,
       forecast: best,
     });
   }
@@ -564,27 +576,195 @@ function buildSpotRecommendations(originLatLng) {
   return diversifyRecommendations(results, 5, 280);
 }
 
-function candidateStationPoints(originLatLng, radiusM) {
+function candidateRecommendationPoints(originLatLng, radiusM) {
+  const originSide = riverSideSign(originLatLng);
+  const candidates = [
+    ...candidateBankStationPoints(originLatLng, radiusM, originSide),
+    ...candidateBuhnePoints(originLatLng, radiusM, originSide),
+    ...candidateAltrheinGridPoints(originLatLng, radiusM, originSide),
+  ];
+  const seen = new Set();
+  return candidates
+    .filter((candidate) => Number.isFinite(candidate.distanceM) && candidate.distanceM <= radiusM)
+    .filter((candidate) => {
+      const key = `${candidate.kind}:${Math.round(candidate.latlng.lat * 10000)}:${Math.round(candidate.latlng.lng * 10000)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => {
+      const priority = { buhne: 0, altrhein_umfeld: 1, ufer: 2 };
+      return (priority[a.kind] ?? 9) - (priority[b.kind] ?? 9) || a.distanceM - b.distanceM;
+    })
+    .slice(0, 90);
+}
+
+function candidateBankStationPoints(originLatLng, radiusM, originSide) {
   const candidates = [];
   const usedKm = new Set();
-  for (const feature of state.geo.stationierung.features || []) {
+  const features = state.geo.stationierung.features || [];
+  for (let index = 0; index < features.length; index += 1) {
+    const feature = features[index];
     if (feature.geometry?.type !== "Point") continue;
     const [lng, lat] = feature.geometry.coordinates;
-    const latlng = L.latLng(lat, lng);
+    const riverPoint = L.latLng(lat, lng);
+    const latlng = offsetStationPoint(index, originSide || -1, 75) || riverPoint;
     const distanceM = haversine(originLatLng, latlng);
     if (distanceM > radiusM) continue;
+    const side = riverSideSign(latlng);
+    if (originSide && side && Math.sign(side) !== Math.sign(originSide)) continue;
     const km = Number(feature.properties?.station_km);
     const bucket = Number.isFinite(km) ? Math.round(km * 5) / 5 : Math.round(distanceM / 250);
     if (usedKm.has(bucket)) continue;
     usedKm.add(bucket);
-    candidates.push({ feature, latlng, distanceM });
+    candidates.push({ feature, latlng, distanceM, kind: "ufer", label: "linkes Ufer/Erlaubniskante", side, originSide });
+  }
+  candidates.sort((a, b) => a.distanceM - b.distanceM);
+  return candidates.slice(0, 40);
+}
+
+function candidateBuhnePoints(originLatLng, radiusM, originSide) {
+  const candidates = [];
+  for (const feature of state.geo.buhnen.features || []) {
+    const point = representativePoint(feature.geometry);
+    if (!point) continue;
+    const distanceM = haversine(originLatLng, point);
+    if (distanceM > radiusM) continue;
+    const side = riverSideSign(point);
+    if (originSide && side && Math.sign(side) !== Math.sign(originSide)) continue;
+    const stationKm = Number(feature.properties?.station_km);
+    if (!Number.isFinite(stationKm)) continue;
+    candidates.push({
+      feature: { ...feature, properties: { ...(feature.properties || {}), station_km: stationKm } },
+      latlng: point,
+      distanceM,
+      kind: "buhne",
+      label: "Buhne/Struktur gleiche Rheinseite",
+      side,
+      originSide,
+    });
   }
   candidates.sort((a, b) => a.distanceM - b.distanceM);
   return candidates.slice(0, 36);
 }
 
-function bestSpeciesForecastForNextTwoHours(baseContext) {
-  const speciesNames = Object.keys(state.species);
+function candidateAltrheinGridPoints(originLatLng, radiusM, originSide) {
+  const candidates = [];
+  const stepM = 300;
+  for (let north = -radiusM; north <= radiusM; north += stepM) {
+    for (let east = -radiusM; east <= radiusM; east += stepM) {
+      if (Math.hypot(east, north) > radiusM) continue;
+      if (Math.abs(east) < 80 && Math.abs(north) < 80) continue;
+      const latlng = offsetLatLng(originLatLng, east, north);
+      const side = riverSideSign(latlng);
+      if (originSide && side && Math.sign(side) !== Math.sign(originSide)) continue;
+      const nearestPermission = nearestFeature(latlng, state.geo.erlaubnis);
+      if (nearestPermission.distanceM > 900 && (!state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length === 0)) continue;
+      const nearestStation = nearestFeature(latlng, state.geo.stationierung);
+      const stationKm = Number(nearestStation.feature?.properties?.station_km);
+      if (!Number.isFinite(stationKm)) continue;
+      candidates.push({
+        feature: { type: "Feature", properties: { station_km: stationKm } },
+        latlng,
+        distanceM: haversine(originLatLng, latlng),
+        kind: "altrhein_umfeld",
+        label: "Altrhein/Umfeld im Suchradius",
+        side,
+        originSide,
+      });
+    }
+  }
+  candidates.sort((a, b) => a.distanceM - b.distanceM);
+  return candidates.slice(0, 36);
+}
+
+function representativePoint(geom) {
+  if (!geom) return null;
+  if (geom.type === "Point") return L.latLng(geom.coordinates[1], geom.coordinates[0]);
+  if (geom.type === "LineString") {
+    const coords = geom.coordinates;
+    if (!coords?.length) return null;
+    const mid = coords[Math.floor(coords.length / 2)];
+    return L.latLng(mid[1], mid[0]);
+  }
+  if (geom.type === "MultiLineString") {
+    const line = (geom.coordinates || []).sort((a, b) => b.length - a.length)[0];
+    return representativePoint({ type: "LineString", coordinates: line });
+  }
+  if (geom.type === "Polygon") {
+    const ring = geom.coordinates?.[0] || [];
+    if (!ring.length) return null;
+    const avg = ring.reduce((sum, coord) => ({ lng: sum.lng + coord[0], lat: sum.lat + coord[1] }), { lng: 0, lat: 0 });
+    return L.latLng(avg.lat / ring.length, avg.lng / ring.length);
+  }
+  if (geom.type === "MultiPolygon") return representativePoint({ type: "Polygon", coordinates: geom.coordinates?.[0] });
+  return null;
+}
+
+function riverSideSign(latlng) {
+  const features = state.geo.stationierung.features || [];
+  let bestIndex = -1;
+  let bestDistance = Infinity;
+  for (let i = 0; i < features.length; i += 1) {
+    const feature = features[i];
+    if (feature.geometry?.type !== "Point") continue;
+    const [lng, lat] = feature.geometry.coordinates;
+    const distance = haversine(latlng, L.latLng(lat, lng));
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = i;
+    }
+  }
+  if (bestIndex < 0) return 0;
+  const prev = stationLatLng(Math.max(0, bestIndex - 2));
+  const next = stationLatLng(Math.min(features.length - 1, bestIndex + 2));
+  if (!prev || !next) return 0;
+  const p = toLocalMeters(latlng, prev.lat);
+  const a = toLocalMeters(prev, prev.lat);
+  const b = toLocalMeters(next, prev.lat);
+  const cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+  if (Math.abs(cross) < 5) return 0;
+  return Math.sign(cross);
+}
+
+function offsetStationPoint(index, sideSign, meters) {
+  const current = stationLatLng(index);
+  const prev = stationLatLng(Math.max(0, index - 2));
+  const next = stationLatLng(Math.min((state.geo.stationierung.features || []).length - 1, index + 2));
+  if (!current || !prev || !next) return current;
+  const lat0 = current.lat;
+  const a = toLocalMeters(prev, lat0);
+  const b = toLocalMeters(next, lat0);
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const normalX = -dy / len * meters * Math.sign(sideSign || -1);
+  const normalY = dx / len * meters * Math.sign(sideSign || -1);
+  return offsetLatLng(current, normalX, normalY);
+}
+
+function stationLatLng(index) {
+  const feature = (state.geo.stationierung.features || [])[index];
+  if (!feature?.geometry?.coordinates) return null;
+  const [lng, lat] = feature.geometry.coordinates;
+  return L.latLng(lat, lng);
+}
+
+function toLocalMeters(latlng, lat0) {
+  return {
+    x: latlng.lng * 111320 * Math.cos(lat0 * Math.PI / 180),
+    y: latlng.lat * 110540,
+  };
+}
+
+function offsetLatLng(latlng, eastM, northM) {
+  const lat = latlng.lat + northM / 110540;
+  const lng = latlng.lng + eastM / (111320 * Math.cos(latlng.lat * Math.PI / 180));
+  return L.latLng(lat, lng);
+}
+
+function bestSpeciesForecastForNextTwoHours(baseContext, targetSpecies) {
+  const speciesNames = targetSpecies && state.species[targetSpecies] ? [targetSpecies] : Object.keys(state.species);
   const baseDate = baseContext.datetime ? new Date(baseContext.datetime) : new Date();
   let best = null;
   for (const species of speciesNames) {
@@ -792,18 +972,19 @@ function spotStatus(erlaubnisstatus, legalInfo) {
 }
 
 function recommendationsHtml(recommendations) {
+  const selectedSpecies = document.querySelector("#speciesSelect")?.value || "Zielfisch";
   if (!recommendations.length) {
     return `
       <section class="recommendation-box">
-        <h3>Top-Spots im 2,5-km-Umkreis</h3>
-        <p class="legal-note">Keine sicheren Vorschläge gefunden. Prüfe Standort, Erlaubnisstrecke und Sperrkulissen.</p>
+        <h3>Top-Spots für ${escapeHtml(selectedSpecies)}</h3>
+        <p class="legal-note">Keine sicheren Vorschläge gefunden. Prüfe Standort, Zielfisch, Erlaubnisstrecke und Sperrkulissen.</p>
       </section>
     `;
   }
   return `
     <section class="recommendation-box">
-      <h3>Top-Spots nächste 2 h</h3>
-      <p class="panel-mini">Beste 4–5 erlaubte Kandidaten im Umkreis von 2,5 km.</p>
+      <h3>Top-Spots für ${escapeHtml(selectedSpecies)} · nächste 2 h</h3>
+      <p class="panel-mini">Beste 4–5 Kandidaten im Umkreis von 2,5 km. Altrhein-/Umfeldpunkte sind Vorprüfung, keine amtliche Freigabe.</p>
       <div class="recommendation-list">
         ${recommendations.map((item, index) => {
           const google = `https://www.google.com/maps/search/?api=1&query=${item.latlng.lat.toFixed(7)},${item.latlng.lng.toFixed(7)}`;
@@ -815,7 +996,7 @@ function recommendationsHtml(recommendations) {
                 <span>${formatNumber(score, 1)}/100</span>
               </div>
               <div class="recommendation-bar"><i style="width:${score}%"></i></div>
-              <small>km ${formatNumber(item.rhein_km, 3)} · ${item.distance_m} m entfernt · Buhne ${item.buhne_m} m</small>
+              <small>${escapeHtml(item.source_label || "Kandidat")} · km ${formatNumber(item.rhein_km, 3)} · ${item.distance_m} m entfernt · Buhne ${item.buhne_m} m</small>
               <div class="recommendation-actions">
                 <button type="button" data-rec-goto="${index}">zeigen</button>
                 <a href="${google}" target="_blank" rel="noopener">Maps</a>
@@ -838,6 +1019,7 @@ function renderRecommendationMarkers(recommendations) {
     });
     marker.bindPopup(`
       <strong>${index + 1}. ${escapeHtml(item.forecast.species)} · ${formatNumber(item.forecast.score, 1)}/100</strong><br>
+      ${escapeHtml(item.source_label || "Kandidat")}<br>
       km ${formatNumber(item.rhein_km, 3)} · ${item.distance_m} m entfernt<br>
       Buhne ${item.buhne_m} m
     `);
