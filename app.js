@@ -544,12 +544,13 @@ function buildSpotRecommendations(originLatLng, targetSpecies) {
     const onWater = isWaterCandidate(latlng, candidate.kind);
     const leftOrUnknownPermission = !permissionSide || permissionSide === "links";
     const inSearchCorridor = !state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length > 0 || nearestPermission.distanceM <= 650;
+    const westOfRhine = isWestOfRhineCenter(latlng);
     const legalInfo = {
       riverKm,
       nearRiver: nearestPermission.distanceM <= 650,
       permissionByKm,
       sperreByKm,
-      erlaubnisOk: Boolean(permissionByKm) && leftOrUnknownPermission && leftBankOk && onWater && inSearchCorridor,
+      erlaubnisOk: Boolean(permissionByKm) && leftOrUnknownPermission && leftBankOk && onWater && inSearchCorridor && westOfRhine,
       gesperrt: Boolean(sperreByKm) || nearestSperre.distanceM <= 120,
     };
     if (!legalInfo.erlaubnisOk || legalInfo.gesperrt) continue;
@@ -581,7 +582,6 @@ function buildSpotRecommendations(originLatLng, targetSpecies) {
 
 function candidateRecommendationPoints(originLatLng, radiusM, fishingBankSign = configuredFishingBankSign()) {
   const candidates = [
-    ...candidatePermissionLinePoints(originLatLng, radiusM),
     ...candidateWaterAreaPoints(originLatLng, radiusM),
   ];
   const seen = new Set();
@@ -594,7 +594,7 @@ function candidateRecommendationPoints(originLatLng, radiusM, fishingBankSign = 
       return true;
     })
     .sort((a, b) => {
-      const priority = { erlaubnislinie: 0, wasserflaeche: 1 };
+      const priority = { wasserflaeche: 0 };
       return (priority[a.kind] ?? 9) - (priority[b.kind] ?? 9) || a.distanceM - b.distanceM;
     })
     .slice(0, 90);
@@ -659,6 +659,7 @@ function candidateWaterAreaPoints(originLatLng, radiusM) {
     for (const latlng of points) {
       const distanceM = haversine(originLatLng, latlng);
       if (distanceM > radiusM) continue;
+      if (!isWestOfRhineCenter(latlng)) continue;
       const nearestLeftPermission = nearestLeftPermissionFeature(latlng);
       if (nearestLeftPermission.distanceM > 650 && (!state.geo.korridor || containingFeatures(latlng, state.geo.korridor).length === 0)) continue;
       const nearestStation = nearestFeature(latlng, state.geo.stationierung);
@@ -734,6 +735,14 @@ function isWaterCandidate(latlng, kind) {
   if (kind === "ufer") return distanceToWater(latlng) <= 120;
   if (kind === "wasserflaeche") return containingFeatures(latlng, state.geo.wasser).length > 0 || distanceToWater(latlng) <= 40;
   return distanceToWater(latlng) <= 80;
+}
+
+function isWestOfRhineCenter(latlng) {
+  const nearestStation = nearestFeature(latlng, state.geo.stationierung);
+  const coords = nearestStation.feature?.geometry?.coordinates;
+  if (!coords) return false;
+  const stationLng = coords[0];
+  return latlng.lng <= stationLng + 0.00015;
 }
 
 function distanceToWater(latlng) {
